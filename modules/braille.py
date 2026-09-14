@@ -17,6 +17,7 @@ braille.py
 """
 
 from __future__ import annotations
+import regex
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
@@ -27,7 +28,7 @@ from typing import List, Tuple, Optional
 DOT_TABLE = {
     # พยัญชนะ
     "ก": [(1, 2, 4, 5)], "ข": [(1, 3)], "ค": [(1, 3, 6)],
-    "ฆ": [(6,), (1, 3)], "ง": [(1, 2, 4, 5, 6)],
+    "ฆ": [(6,), (1, 3, 6)], "ง": [(1, 2, 4, 5, 6)],
     "จ": [(2, 4, 5)], "ฉ": [(3, 4)], "ช": [(3, 4, 6)],
     "ซ": [(2, 3, 4, 6)], "ฌ": [(6,), (3, 4, 6)], "ญ": [(6,), (1, 3, 4, 5, 6)],
     "ฎ": [(6,), (1, 4, 5)], "ฏ": [(6,), (1, 2, 5, 6)],
@@ -42,9 +43,14 @@ DOT_TABLE = {
     "ว": [(2, 4, 5, 6)], "ศ": [(6,), (2, 3, 4)], "ษ": [(3, 6), (2, 3, 4)],
     "ส": [(2, 3, 4)], "ห": [(1, 2, 5)], "ฬ": [(6,), (1, 2, 3)],
     "อ": [(1, 3, 5)], "ฮ": [(1, 2, 3, 4, 5, 6)],
+    # ฤ/ฦ (rue/lue) ที่หายไปจากตารางเดิม -> ประกอบจาก ร/ล + จุดพิเศษ (2,) ตามมาตรฐาน
+    # หมายเหตุ: แปลงทีละอักขระ Unicode ดังนั้น "ฤๅ"/"ฦๅ" ไม่ต้องใส่เป็น key รวม
+    # เพราะ ฤ + ๅ (lakkhangyao) จะถูกแปลงแยกแล้วต่อกันเป็น 3 เซลล์ถูกต้องเองอยู่แล้ว
+    "ฤ": [(1, 2, 3, 5), (2,)], "ฦ": [(1, 2, 3), (2,)],
+    "ๅ": [(1, 6)],  # lakkhangyao (ตัวยาว) ที่ตามหลัง ฤ/ฦ
 
     # สระ (แสดงเป็นรูปเดี่ยว ต่อท้ายพยัญชนะตามลำดับการอ่าน)
-    "ะ": [(1,)], "ั": [(1,)],  # mai han akat / sara a (สั้น)
+    "ะ": [(1,)], "ั": [(3, 4, 5)],  # sara a เปิดพยางค์ = (1,) / ไม้หันอากาศปิดพยางค์ = (3,4,5) คนละจุดกัน
     "ิ": [(1, 2)], "ึ": [(2, 4, 6)], "ุ": [(1, 4)],
     "า": [(1, 6)], "ี": [(2, 3)], "ื": [(2, 6)], "ู": [(2, 5)],
     "เ": [(1, 2, 4)], "แ": [(1, 2, 6)], "โ": [(2, 4)], "อ_o": [(1, 3, 5)],
@@ -68,9 +74,14 @@ DOT_TABLE = {
     ",": [(2,)], ".": [(4, 5, 6), (2, 5, 6)], "?": [(4, 5, 6), (2, 3, 6)],
     "!": [(4, 5, 6), (2, 3, 5)], "-": [(3, 6)],
 }
-NUM_PREFIX = [(6,), (3, 4, 5, 6)]
+NUM_PREFIX_THAI = [(6,), (3, 4, 5, 6)]   # ตัวเลขไทย (๑๒๓...) ต้องมี dot-6 นำหน้าเพื่อบอกว่าเป็นเลขไทย/ลาว
+NUM_PREFIX_ARABIC = [(3, 4, 5, 6)]        # ตัวเลขอารบิกใช้แค่เครื่องหมายตัวเลขสากลเฉยๆ ไม่ต้องมี dot-6
 THAI_DIGITS = set("๑๒๓๔๕๖๗๘๙๐")
 ARABIC_DIGITS = set("1234567890")
+
+# กฎการสลับตำแหน่ง: ในตัวพิมพ์ วรรณยุกต์เขียนหลังสระ ะ/ำ (เช่น "น้ำ" = น+้+ำ)
+# แต่ในเบรลล์ไทย สระ ะ และ ำ ต้องมาก่อนวรรณยุกต์เสมอ (สลับกับลำดับตัวพิมพ์)
+_TONE_MARK_BEFORE_SARA_RE = regex.compile(r"([่้๊๋])([ะำ])")
 
 # ตาราง Braille ASCII มาตรฐาน (North American Braille ASCII / BRF) 64 ตัวอักษร
 # ดัชนี = ผลรวม 2^(หมายเลขจุด-1) ของจุดที่ยกขึ้นในเซลล์นั้น (ตรงกับลำดับบิตของ Unicode Braille Patterns)
@@ -105,6 +116,10 @@ class BrailleConversionResult:
 
 def text_to_braille(text: str) -> BrailleConversionResult:
     """แปลงข้อความไทยหนึ่งสตริงให้เป็นลำดับเซลล์เบรลล์ (รองรับเว้นวรรค ตัวเลข วรรคตอนพื้นฐาน)"""
+    # สลับตำแหน่งวรรณยุกต์กับสระ ะ/ำ ก่อนแปลง (กฎเบรลล์ไทย: ะ/ำ ต้องมาก่อนวรรณยุกต์เสมอ
+    # ตรงข้ามกับลำดับตัวพิมพ์ปกติ เช่น "น้ำ" ต้องแปลงในลำดับ น -> ำ -> ้ ไม่ใช่ น -> ้ -> ำ)
+    text = _TONE_MARK_BEFORE_SARA_RE.sub(lambda m: m.group(2) + m.group(1), text)
+
     cells: List[Tuple[int, ...]] = []
     unmapped: List[str] = []
     total = 0
@@ -115,9 +130,10 @@ def text_to_braille(text: str) -> BrailleConversionResult:
         if ch == "\n":
             continue
         total += 1
-        is_digit = ch in THAI_DIGITS or ch in ARABIC_DIGITS
+        is_thai_digit = ch in THAI_DIGITS
+        is_digit = is_thai_digit or ch in ARABIC_DIGITS
         if is_digit and not prev_was_digit:
-            cells.extend(NUM_PREFIX)
+            cells.extend(NUM_PREFIX_THAI if is_thai_digit else NUM_PREFIX_ARABIC)
         prev_was_digit = is_digit
 
         entry = DOT_TABLE.get(ch)
@@ -143,31 +159,63 @@ def build_brf(
     paragraphs: List[str],
     cells_per_line: int = 40,
     lines_per_page: int = 25,
+    source_pages: Optional[List[int]] = None,
 ) -> Tuple[str, BrailleConversionResult]:
     """ประกอบย่อหน้าทั้งหมด -> ไฟล์ .brf เดียว โดยตัดบรรทัด/แบ่งหน้าตามมาตรฐาน
     (ค่าเริ่มต้น 40 เซลล์/บรรทัด, 25 บรรทัด/หน้า ตามธรรมเนียม BRF ทั่วไป
     ปรับได้ตามขนาดกระดาษเบรลล์ที่ใช้จริง)
+
+    source_pages: รายการ "เลขหน้าต้นฉบับ" ของแต่ละย่อหน้า (ความยาวเท่ากับ paragraphs)
+    ถ้าระบุมา -> การขึ้นหน้าเบรลล์ใหม่ (form-feed) จะยึดตามการเปลี่ยนหน้าต้นฉบับจริงเป็นหลัก
+    (จะไม่ตัดกลางประโยค/ย่อหน้าเดิมที่ยังอยู่หน้าเดียวกันจากต้นฉบับ) โดยยังคงตัดแบ่ง
+    หน้าเบรลล์เพิ่มเติมตาม lines_per_page เป็น safety net เฉพาะกรณีหน้าต้นฉบับเดียว
+    ยาวเกินกว่าจะใส่ในแผ่นเบรลล์แผ่นเดียวได้จริง
+    ถ้าไม่ระบุ (None) -> ทำงานแบบเดิม คือตัดหน้าเบรลล์ทุก lines_per_page บรรทัดล้วนๆ
     """
     full_text = "\n".join(paragraphs)
     result = text_to_braille(full_text)
 
+    if source_pages is not None and len(source_pages) != len(paragraphs):
+        raise ValueError("source_pages ต้องมีความยาวเท่ากับ paragraphs")
+
     # ตัดบรรทัดจาก ascii_text ตาม cells_per_line โดยเคารพการขึ้นย่อหน้าใหม่ (\n ในต้นฉบับ)
+    # พร้อมจดจำว่าแต่ละบรรทัดที่ตัดออกมา มาจากหน้าต้นฉบับหน้าไหน (ถ้ามีข้อมูล)
     lines: List[str] = []
-    for para in paragraphs:
+    line_source_page: List[Optional[int]] = []
+    for idx, para in enumerate(paragraphs):
         para_result = text_to_braille(para)
         ascii_line = para_result.ascii_text
+        page_no = source_pages[idx] if source_pages is not None else None
         if not ascii_line:
             lines.append("")
+            line_source_page.append(page_no)
             continue
         for i in range(0, len(ascii_line), cells_per_line):
             lines.append(ascii_line[i : i + cells_per_line])
+            line_source_page.append(page_no)
 
-    # แบ่งหน้าโดยแทรก form-feed (\x0c) ทุก lines_per_page บรรทัด ตามธรรมเนียมไฟล์ .brf
+    # แบ่งหน้าเบรลล์: ถ้ามี source_pages ให้ขึ้นหน้าใหม่ตอนหน้าต้นฉบับเปลี่ยนเป็นหลัก
+    # (นับจำนวนบรรทัดในหน้าเบรลล์ปัจจุบันแยกต่างหาก เพื่อยังกันไม่ให้หน้าต้นฉบับเดียว
+    # ที่ยาวมากล้นแผ่นเบรลล์แผ่นเดียว)
     out_lines: List[str] = []
+    lines_in_current_brf_page = 0
+    prev_source_page: Optional[int] = None
     for i, line in enumerate(lines):
-        if i > 0 and i % lines_per_page == 0:
+        cur_source_page = line_source_page[i]
+        page_changed = (
+            source_pages is not None
+            and i > 0
+            and cur_source_page != prev_source_page
+        )
+        overflow = lines_in_current_brf_page >= lines_per_page
+
+        if i > 0 and (page_changed or overflow):
             out_lines.append("\x0c")
+            lines_in_current_brf_page = 0
+
         out_lines.append(line)
+        lines_in_current_brf_page += 1
+        prev_source_page = cur_source_page
 
     brf_content = "\n".join(out_lines)
     return brf_content, result
